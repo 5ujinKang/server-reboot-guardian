@@ -39,7 +39,7 @@ cat > "$SUDOERS_FILE" << 'EOF'
 # server-reboot-guardian: intercept sudo reboot on shared servers
 
 # Guardian runs as root and keeps SUDO_USER so it knows who asked
-Defaults!server-reboot-guardian env_keep += "SUDO_USER"
+Defaults!/usr/local/sbin/server-reboot-guardian env_keep += "SUDO_USER"
 
 # Allow all users to run the guardian via "sudo reboot"
 Cmnd_Alias SRG_GUARDIAN = /usr/local/sbin/server-reboot-guardian
