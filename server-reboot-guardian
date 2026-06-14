@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""
+Server Reboot Guardian
+Intercepts reboot requests on shared servers, notifies all logged-in users,
+shows pending system changes, and waits for consent before rebooting.
+"""
+
+import os
+import sys
+import subprocess
+import time
+import json
+import socket
+import signal
+import pwd
+import glob
+from pathlib import Path
+from datetime import datetime
+
+VOTE_DIR = "/run/server-reboot-vote"
+VOTE_FILE = f"{VOTE_DIR}/vote_state.json"
+REAL_REBOOT = "/sbin/reboot"
+DEFAULT_TIMEOUT_SECS = 300  # 5 minutes
+PRE_REBOOT_SNAPSHOT_DIR  = Path("/var/lib/server-reboot-guardian")
+PRE_REBOOT_SNAPSHOT_FILE = PRE_REBOOT_SNAPSHOT_DIR / "pre_reboot_snapshot.json"
+
+
+def get_requesting_user():
+    sudo_user = os.environ.get("SUDO_USER", "").strip()
+    if sudo_user:
+        return sudo_user
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return "unknown"
+
+
+def get_logged_in_users():
+    try:
+        result = subprocess.run(["who"], capture_output=True, text=True)
+        users = {}
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                user, tty = parts[0], parts[1]
+                users.setdefault(user, []).append(tty)
+        return users  # {username: [tty, ...]}
+    except Exception:
+        return {}
+
+
+def broadcast(message):
+    try:
+        subprocess.run(["wall", "-n"], input=message, text=True, capture_output=True)
+    except Exception:
+        subprocess.run(["wall"], input=message, text=True, capture_output=True)
+
+
+def get_uptime_str():
+    try:
+        with open("/proc/uptime") as f:
+            secs = float(f.read().split()[0])
+        days, rem = divmod(int(secs), 86400)
+        hours, rem = divmod(rem, 3600)
+        mins = rem // 60
+        return f"{days}d {hours}h {mins}m"
+    except Exception:
+        return "unknown"
+
+
+def get_running_kernel():
+    return subprocess.run(["uname", "-r"], capture_output=True, text=True).stdout.strip()
+
+
+def get_pending_changes():
+    changes = []
+    running_kernel = get_running_kernel()
+
+    # Newest installed kernel vs running kernel
+    boot_vmlinuz = sorted(glob.glob("/boot/vmlinuz-*"))
+    if boot_vmlinuz:
+        latest = boot_vmlinuz[-1].replace("/boot/vmlinuz-", "")
+        if latest != running_kernel:
+            changes.append(("Kernel upgrade", f"{running_kernel}  →  {latest}"))
+
+    # Ubuntu/Debian reboot-required packages
+    reboot_pkgs = Path("/var/run/reboot-required.pkgs")
+    if reboot_pkgs.exists():
+        pkgs = [p for p in reboot_pkgs.read_text().strip().splitlines() if p]
+        if pkgs:
+            preview = ", ".join(pkgs[:5]) + (f"  (+{len(pkgs)-5} more)" if len(pkgs) > 5 else "")
+            changes.append(("Packages needing reboot", preview))
+    elif Path("/var/run/reboot-required").exists():
+        changes.append(("Reboot flagged", "System has been marked as requiring a reboot"))
+
+    # Firmware updates via fwupd
+    try:
+        result = subprocess.run(
+            ["fwupdmgr", "get-updates", "--no-reboot-check"],
+            capture_output=True, text=True, timeout=10,
+        )
+        output = result.stdout + result.stderr
+        if "No upgrades" not in output and "FAILED" not in output and output.strip():
+            changes.append(("Firmware (fwupd)", "Pending firmware updates available"))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Failed systemd units that will auto-restart
+    try:
+        result = subprocess.run(
+            ["systemctl", "list-units", "--state=failed", "--no-legend"],
+            capture_output=True, text=True,
+        )
+        failed = [l.split()[0] for l in result.stdout.strip().splitlines() if l.strip()]
+        if failed:
+            preview = ", ".join(failed[:4]) + (f"  (+{len(failed)-4} more)" if len(failed) > 4 else "")
+            changes.append(("Failed units (will restart)", preview))
+    except Exception:
+        pass
+
+    # Active NFS / CIFS mounts that will drop
+    try:
+        result = subprocess.run(["mount"], capture_output=True, text=True)
+        net_mounts = [
+            l.split()[0]
+            for l in result.stdout.splitlines()
+            if any(t in l for t in ("type nfs", "type cifs", "type smbfs"))
+        ]
+        if net_mounts:
+            preview = ", ".join(net_mounts[:3]) + (f"  (+{len(net_mounts)-3} more)" if len(net_mounts) > 3 else "")
+            changes.append(("Network mounts (will disconnect)", preview))
+    except Exception:
+        pass
+
+    # NUMA / hardware topology note (informational)
+    try:
+        result = subprocess.run(["lscpu"], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if "NUMA node(s)" in line:
+                val = line.split(":")[1].strip()
+                if int(val) > 1:
+                    changes.append(("NUMA topology", f"{val} NUMA nodes — memory locality will reset"))
+                break
+    except Exception:
+        pass
+
+    return changes
+
+
+def format_banner(requesting_user, hostname, users_map, running_kernel, changes, timeout_secs):
+    other_users = [u for u in users_map if u != requesting_user]
+    user_list = ", ".join(sorted(users_map.keys())) if users_map else "none"
+
+    lines = [
+        "",
+        "=" * 72,
+        "  REBOOT REQUEST — " + hostname,
+        "=" * 72,
+        f"  Requested by : {requesting_user}",
+        f"  Time         : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  Uptime       : {get_uptime_str()}",
+        f"  Running kernel: {running_kernel}",
+        f"  Logged-in users: {user_list}",
+        "",
+    ]
+
+    if changes:
+        lines.append("  CHANGES THAT TAKE EFFECT AFTER REBOOT:")
+        for label, detail in changes:
+            lines.append(f"    [{label}]  {detail}")
+    else:
+        lines.append("  No pending kernel / firmware / package changes detected.")
+
+    lines.append("")
+
+    if other_users:
+        lines += [
+            f"  Other users online: {', '.join(sorted(other_users))}",
+            "",
+            "  To APPROVE this reboot:  reboot-vote yes",
+            "  To OBJECT  this reboot:  reboot-vote no",
+            "  To see current status:   reboot-vote status",
+            "",
+            f"  Reboot proceeds in {timeout_secs // 60}m if no one objects.",
+        ]
+    else:
+        lines += [
+            "  No other users logged in.",
+            "",
+            f"  Rebooting in 15 seconds — Ctrl+C to cancel.",
+        ]
+
+    lines += ["=" * 72, ""]
+    return "\n".join(lines)
+
+
+def init_vote_state(requesting_user, users_map, timeout_secs):
+    os.makedirs(VOTE_DIR, mode=0o1777, exist_ok=True)
+    eligible = [u for u in users_map if u != requesting_user]
+    state = {
+        "requesting_user": requesting_user,
+        "hostname": socket.gethostname(),
+        "started_at": datetime.now().isoformat(),
+        "timeout_at": time.time() + timeout_secs,
+        "eligible_voters": eligible,
+        "votes": {},
+        "status": "pending",
+    }
+    with open(VOTE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+    os.chmod(VOTE_FILE, 0o666)
+    return state
+
+
+def read_vote_state():
+    try:
+        with open(VOTE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def check_consensus(state):
+    """Returns ('proceed'|'cancel'|'wait', reason_str)."""
+    voters = state["eligible_voters"]
+    votes = state["votes"]
+    now = time.time()
+
+    objectors = [u for u, v in votes.items() if v == "no"]
+    approvers = [u for u, v in votes.items() if v == "yes"]
+
+    if objectors:
+        return "cancel", f"Objected by: {', '.join(objectors)}"
+
+    if not voters:
+        return "proceed", "No other users logged in"
+
+    if len(approvers) == len(voters):
+        return "proceed", f"All users approved: {', '.join(approvers)}"
+
+    if now > state["timeout_at"]:
+        return "proceed", f"Timeout reached — no objections ({len(approvers)}/{len(voters)} explicitly approved)"
+
+    pending = [u for u in voters if u not in votes]
+    secs_left = max(0, int(state["timeout_at"] - now))
+    return "wait", (
+        f"{len(approvers)} approved, waiting on {', '.join(pending)} "
+        f"({secs_left}s remaining)"
+    )
+
+
+def cleanup_vote():
+    try:
+        Path(VOTE_FILE).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _run(cmd, timeout=8):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout.strip()
+    except Exception:
+        return ""
+
+
+def save_pre_reboot_snapshot():
+    """Save a hardware snapshot to /var/lib/server-reboot-guardian/ before shutdown."""
+    snap = {}
+    snap["kernel"] = _run(["uname", "-r"])
+
+    cpu = {}
+    for line in _run(["lscpu"]).splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            k = k.strip()
+            if k in ("Architecture", "CPU(s)", "Model name", "Thread(s) per core",
+                      "Core(s) per socket", "Socket(s)", "NUMA node(s)", "CPU MHz", "CPU max MHz"):
+                cpu[k] = v.strip()
+    snap["cpu"] = cpu
+
+    mem = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            if k.strip() in ("MemTotal", "SwapTotal"):
+                mem[k.strip()] = v.strip()
+    except Exception:
+        pass
+    snap["memory"] = mem
+
+    snap["pci_devices"] = sorted(_run(["lspci", "-mm"]).splitlines())
+
+    try:
+        raw = _run(["lsblk", "--json", "-o", "NAME,SIZE,TYPE,MODEL,TRAN"])
+        snap["block_devices"] = json.loads(raw) if raw else {}
+    except Exception:
+        snap["block_devices"] = {}
+
+    try:
+        raw = _run(["ip", "-j", "link"])
+        ifaces = json.loads(raw) if raw else []
+        snap["network_interfaces"] = sorted(
+            [{"ifname": i.get("ifname"), "link_type": i.get("link_type"), "address": i.get("address")}
+             for i in ifaces],
+            key=lambda x: x.get("ifname", ""),
+        )
+    except Exception:
+        snap["network_interfaces"] = []
+
+    dmi = {}
+    dmi_path = Path("/sys/class/dmi/id")
+    for field in ("bios_version", "bios_date", "board_name", "product_name", "sys_vendor"):
+        p = dmi_path / field
+        if p.exists():
+            try:
+                dmi[field] = p.read_text().strip()
+            except Exception:
+                pass
+    snap["dmi"] = dmi
+
+    snap["recorded_at"] = datetime.now().isoformat()
+
+    try:
+        PRE_REBOOT_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        PRE_REBOOT_SNAPSHOT_FILE.write_text(json.dumps(snap, indent=2))
+        os.chmod(PRE_REBOOT_SNAPSHOT_FILE, 0o644)
+    except Exception as e:
+        print(f"Warning: could not save pre-reboot snapshot: {e}", file=sys.stderr)
+
+
+def do_reboot(extra_args, reason):
+    cleanup_vote()
+    broadcast(f"\n!!! SERVER IS REBOOTING NOW !!!\nReason: {reason}\n")
+    save_pre_reboot_snapshot()
+    time.sleep(2)
+    os.execv(REAL_REBOOT, [REAL_REBOOT] + extra_args)
+
+
+def main():
+    if os.geteuid() != 0:
+        print("Error: must be run as root (via sudo)", file=sys.stderr)
+        sys.exit(1)
+
+    # Pass-through flags like -h, -f, -p, etc.
+    extra_args = sys.argv[1:]
+
+    requesting_user = get_requesting_user()
+    hostname = socket.gethostname()
+    users_map = get_logged_in_users()
+    running_kernel = get_running_kernel()
+    changes = get_pending_changes()
+
+    timeout_secs = DEFAULT_TIMEOUT_SECS
+
+    banner = format_banner(
+        requesting_user, hostname, users_map, running_kernel, changes, timeout_secs
+    )
+    print(banner)
+    broadcast(banner)
+
+    other_users = [u for u in users_map if u != requesting_user]
+
+    if not other_users:
+        def _cancel(sig, frame):
+            print("\nReboot cancelled.")
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, _cancel)
+        time.sleep(15)
+        do_reboot(extra_args, f"Requested by {requesting_user} — no other users online")
+        return
+
+    state = init_vote_state(requesting_user, users_map, timeout_secs)
+    print(f"Waiting for votes from: {', '.join(sorted(other_users))}\n")
+
+    def _cancel(sig, frame):
+        cleanup_vote()
+        broadcast(
+            f"\nReboot request by {requesting_user} on {hostname} "
+            f"has been CANCELLED by the requester.\n"
+        )
+        print("\nReboot cancelled.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _cancel)
+
+    last_msg = ""
+    while True:
+        state = read_vote_state()
+        if state is None:
+            print("Vote state disappeared — aborting.")
+            sys.exit(1)
+
+        result, reason = check_consensus(state)
+        msg = f"[{datetime.now().strftime('%H:%M:%S')}] {reason}"
+        if msg != last_msg:
+            print(msg)
+            last_msg = msg
+
+        if result == "proceed":
+            broadcast(
+                f"\nReboot APPROVED on {hostname}. "
+                f"Server is rebooting now...\nReason: {reason}\n"
+            )
+            do_reboot(extra_args, reason)
+        elif result == "cancel":
+            cleanup_vote()
+            broadcast(
+                f"\nReboot request by {requesting_user} on {hostname} "
+                f"has been CANCELLED.\nReason: {reason}\n"
+            )
+            print(f"\nReboot cancelled: {reason}")
+            sys.exit(0)
+
+        time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

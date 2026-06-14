@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""
+check-reboot-changes
+Run at login (add to ~/.bash_profile or /etc/profile.d/reboot-check.sh) to
+detect whether the server was rebooted since your last session and show any
+hardware changes.
+
+Snapshot stored per-user in ~/.cache/server-reboot-guardian/hw_snapshot.json
+A system-wide pre-reboot snapshot (written by server-reboot-guardian before
+shutdown) is also consulted when available for a before/after comparison.
+"""
+
+import json
+import os
+import pwd
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+SYSTEM_PRE_REBOOT_SNAPSHOT = Path("/var/lib/server-reboot-guardian/pre_reboot_snapshot.json")
+SNAPSHOT_DIR  = Path.home() / ".cache" / "server-reboot-guardian"
+SNAPSHOT_FILE = SNAPSHOT_DIR / "hw_snapshot.json"
+
+
+# ---------------------------------------------------------------------------
+# Boot / login time helpers
+# ---------------------------------------------------------------------------
+
+def get_last_boot_time() -> datetime | None:
+    # Prefer 'who -b' (most distros)
+    try:
+        out = subprocess.run(["who", "-b"], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            if "boot" in line:
+                parts = line.strip().split()
+                return datetime.strptime(f"{parts[-2]} {parts[-1]}", "%Y-%m-%d %H:%M")
+    except Exception:
+        pass
+    # Fallback: /proc/uptime
+    try:
+        with open("/proc/uptime") as f:
+            secs = float(f.read().split()[0])
+        return datetime.fromtimestamp(datetime.now().timestamp() - secs)
+    except Exception:
+        return None
+
+
+def get_previous_login_time(username: str) -> datetime | None:
+    """Return the start time of the login BEFORE the current session."""
+    try:
+        out = subprocess.run(
+            ["last", "-F", "-n", "6", username],
+            capture_output=True, text=True,
+        ).stdout
+        entries = [l for l in out.splitlines() if l.startswith(username)]
+        # entries[0] = current session; entries[1] = previous session
+        if len(entries) >= 2:
+            parts = entries[1].split()
+            # layout: user tty host DoW Mon DD HH:MM:SS YYYY ...
+            dt_str = " ".join(parts[3:8])
+            return datetime.strptime(dt_str, "%a %b %d %H:%M:%S %Y")
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Hardware snapshot collection (no root required)
+# ---------------------------------------------------------------------------
+
+def _run(cmd: list[str], timeout=8) -> str:
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def collect_hardware_snapshot() -> dict:
+    snap: dict = {}
+
+    # Kernel
+    snap["kernel"] = _run(["uname", "-r"])
+
+    # CPU
+    snap["cpu"] = {}
+    for line in _run(["lscpu"]).splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            k = k.strip()
+            if k in (
+                "Architecture", "CPU(s)", "Model name",
+                "Thread(s) per core", "Core(s) per socket", "Socket(s)",
+                "NUMA node(s)", "CPU MHz", "CPU max MHz",
+            ):
+                snap["cpu"][k] = v.strip()
+
+    # Memory (MB totals from /proc/meminfo)
+    mem = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            k = k.strip()
+            if k in ("MemTotal", "SwapTotal"):
+                mem[k] = v.strip()
+    except Exception:
+        pass
+    snap["memory"] = mem
+
+    # PCI devices (vendor:device pairs, sorted for stable comparison)
+    pci_lines = _run(["lspci", "-mm"]).splitlines()
+    snap["pci_devices"] = sorted(pci_lines)
+
+    # Block devices
+    try:
+        blk_raw = _run(["lsblk", "--json", "-o", "NAME,SIZE,TYPE,MODEL,TRAN"])
+        snap["block_devices"] = json.loads(blk_raw) if blk_raw else {}
+    except Exception:
+        snap["block_devices"] = {}
+
+    # Network interfaces
+    try:
+        net_raw = _run(["ip", "-j", "link"])
+        ifaces = json.loads(net_raw) if net_raw else []
+        snap["network_interfaces"] = sorted(
+            [{"ifname": i.get("ifname"), "link_type": i.get("link_type"),
+              "address": i.get("address")}
+             for i in ifaces],
+            key=lambda x: x.get("ifname", ""),
+        )
+    except Exception:
+        snap["network_interfaces"] = []
+
+    # DMI / firmware info (readable without root via sysfs)
+    dmi = {}
+    dmi_sysfs = Path("/sys/class/dmi/id")
+    for field in ("bios_version", "bios_date", "board_name",
+                  "product_name", "sys_vendor"):
+        p = dmi_sysfs / field
+        if p.exists():
+            try:
+                dmi[field] = p.read_text().strip()
+            except Exception:
+                pass
+    snap["dmi"] = dmi
+
+    snap["recorded_at"] = datetime.now().isoformat()
+    snap["boot_time"]   = get_last_boot_time().isoformat() if get_last_boot_time() else None
+
+    return snap
+
+
+# ---------------------------------------------------------------------------
+# Diff helpers
+# ---------------------------------------------------------------------------
+
+def _diff_dict(label: str, old: dict, new: dict, lines: list[str]):
+    all_keys = sorted(set(old) | set(new))
+    for k in all_keys:
+        o, n = old.get(k), new.get(k)
+        if o != n:
+            if o is None:
+                lines.append(f"  + {label} / {k}: {n}")
+            elif n is None:
+                lines.append(f"  - {label} / {k}: {o}")
+            else:
+                lines.append(f"  ~ {label} / {k}:  {o}  →  {n}")
+
+
+def _diff_sorted_list(label: str, old: list, new: list, lines: list[str]):
+    removed = [x for x in old if x not in new]
+    added   = [x for x in new if x not in old]
+    for x in removed:
+        lines.append(f"  - {label}: {x}")
+    for x in added:
+        lines.append(f"  + {label}: {x}")
+
+
+def _diff_iface_list(old: list, new: list, lines: list[str]):
+    old_map = {i.get("ifname"): i for i in old}
+    new_map = {i.get("ifname"): i for i in new}
+    for name in sorted(set(old_map) | set(new_map)):
+        o, n = old_map.get(name), new_map.get(name)
+        if o is None:
+            lines.append(f"  + Network interface added:   {name}  ({n.get('link_type','')}  {n.get('address','')})")
+        elif n is None:
+            lines.append(f"  - Network interface removed: {name}")
+        elif o != n:
+            lines.append(f"  ~ Network interface changed: {name}  {o.get('address','')} → {n.get('address','')}")
+
+
+def _diff_block(old: dict, new: dict, lines: list[str]):
+    def flatten(blk, prefix=""):
+        result = {}
+        for dev in blk.get("blockdevices", []):
+            name = prefix + dev.get("name", "?")
+            result[name] = f"{dev.get('size','?')}  {dev.get('type','?')}  {dev.get('model','').strip()}  {dev.get('tran','')}"
+            if dev.get("children"):
+                result.update(flatten({"blockdevices": dev["children"]}, name + "/"))
+        return result
+
+    _diff_dict("Block device", flatten(old), flatten(new), lines)
+
+
+def diff_snapshots(old: dict, new: dict) -> list[str]:
+    lines = []
+
+    # Kernel
+    if old.get("kernel") != new.get("kernel"):
+        lines.append(f"  ~ Kernel:  {old.get('kernel')}  →  {new.get('kernel')}")
+
+    # CPU
+    _diff_dict("CPU", old.get("cpu", {}), new.get("cpu", {}), lines)
+
+    # Memory
+    _diff_dict("Memory", old.get("memory", {}), new.get("memory", {}), lines)
+
+    # PCI
+    _diff_sorted_list("PCI device", old.get("pci_devices", []), new.get("pci_devices", []), lines)
+
+    # Block
+    _diff_block(old.get("block_devices", {}), new.get("block_devices", {}), lines)
+
+    # Network
+    _diff_iface_list(old.get("network_interfaces", []), new.get("network_interfaces", []), lines)
+
+    # DMI / firmware
+    _diff_dict("Firmware/DMI", old.get("dmi", {}), new.get("dmi", {}), lines)
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    username = pwd.getpwuid(os.getuid()).pw_name
+    boot_time = get_last_boot_time()
+    prev_login = get_previous_login_time(username)
+
+    # Load saved snapshot from last login
+    saved: dict | None = None
+    if SNAPSHOT_FILE.exists():
+        try:
+            saved = json.loads(SNAPSHOT_FILE.read_text())
+        except Exception:
+            saved = None
+
+    rebooted = False
+    if boot_time and saved and saved.get("boot_time"):
+        saved_boot = datetime.fromisoformat(saved["boot_time"])
+        rebooted = boot_time > saved_boot
+
+    # Collect current hardware state
+    current = collect_hardware_snapshot()
+
+    if not rebooted:
+        # Silently update snapshot and exit — nothing to report
+        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        SNAPSHOT_FILE.write_text(json.dumps(current, indent=2))
+        return
+
+    # --- Server was rebooted since last login ---
+    print()
+    print("=" * 68)
+    print("  SERVER WAS REBOOTED since your last login")
+    print("=" * 68)
+    if prev_login:
+        print(f"  Your last login : {prev_login.strftime('%Y-%m-%d %H:%M')}")
+    if boot_time:
+        print(f"  Server rebooted : {boot_time.strftime('%Y-%m-%d %H:%M')}")
+    print()
+
+    # Prefer system-wide pre-reboot snapshot for hardware diff (written by
+    # server-reboot-guardian just before shutdown) — falls back to the user's
+    # last-login snapshot which may be older.
+    baseline: dict | None = None
+    baseline_label = ""
+
+    if SYSTEM_PRE_REBOOT_SNAPSHOT.exists():
+        try:
+            baseline = json.loads(SYSTEM_PRE_REBOOT_SNAPSHOT.read_text())
+            baseline_label = f"(pre-reboot snapshot from {baseline.get('recorded_at','?')[:16]})"
+        except Exception:
+            pass
+
+    if baseline is None and saved:
+        baseline = saved
+        baseline_label = f"(your last-login snapshot from {saved.get('recorded_at','?')[:16]})"
+
+    if baseline:
+        diffs = diff_snapshots(baseline, current)
+        if diffs:
+            print(f"  HARDWARE / SYSTEM CHANGES {baseline_label}:")
+            for line in diffs:
+                print(line)
+        else:
+            print(f"  No hardware or kernel changes detected {baseline_label}.")
+    else:
+        print("  No baseline snapshot available for comparison.")
+        print("  (A snapshot will be saved now for future logins.)")
+
+    print()
+    print(f"  Current kernel : {current.get('kernel', 'unknown')}")
+    cpu_model = current.get("cpu", {}).get("Model name", "unknown")
+    print(f"  CPU            : {cpu_model}")
+    mem_total = current.get("memory", {}).get("MemTotal", "unknown")
+    print(f"  Memory total   : {mem_total}")
+    print("=" * 68)
+    print()
+
+    # Save updated snapshot
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT_FILE.write_text(json.dumps(current, indent=2))
+
+
+if __name__ == "__main__":
+    main()

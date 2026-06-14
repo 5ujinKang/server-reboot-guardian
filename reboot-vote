@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""
+reboot-vote — cast or check a vote on a pending server reboot request.
+Usage:
+  reboot-vote yes     approve the pending reboot
+  reboot-vote no      object to the pending reboot (cancels it)
+  reboot-vote status  show current vote state
+"""
+
+import os
+import sys
+import json
+import pwd
+from pathlib import Path
+from datetime import datetime
+
+VOTE_FILE = "/run/server-reboot-vote/vote_state.json"
+
+
+def get_current_user():
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return "unknown"
+
+
+def load_state():
+    if not Path(VOTE_FILE).exists():
+        return None
+    try:
+        with open(VOTE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_state(state):
+    try:
+        with open(VOTE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except PermissionError:
+        print("Error: cannot write vote file (permission denied).", file=sys.stderr)
+        sys.exit(1)
+
+
+def fmt_time_left(timeout_at):
+    import time
+    secs = max(0, int(timeout_at - time.time()))
+    return f"{secs // 60}m {secs % 60}s"
+
+
+def cmd_status(state):
+    voters = state["eligible_voters"]
+    votes = state["votes"]
+    approvers = [u for u, v in votes.items() if v == "yes"]
+    objectors = [u for u, v in votes.items() if v == "no"]
+    pending = [u for u in voters if u not in votes]
+
+    print(f"Pending reboot on {state['hostname']}")
+    print(f"  Requested by : {state['requesting_user']}")
+    print(f"  Started at   : {state['started_at']}")
+    print(f"  Time left    : {fmt_time_left(state['timeout_at'])}")
+    print(f"  Approved     : {', '.join(approvers) if approvers else '—'}")
+    print(f"  Objected     : {', '.join(objectors) if objectors else '—'}")
+    print(f"  No response  : {', '.join(pending) if pending else '—'}")
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1].lower() not in ("yes", "no", "status"):
+        print(__doc__.strip())
+        sys.exit(1)
+
+    action = sys.argv[1].lower()
+    state = load_state()
+
+    if state is None:
+        print("No pending reboot vote.")
+        sys.exit(0)
+
+    if action == "status":
+        cmd_status(state)
+        return
+
+    current_user = get_current_user()
+
+    if current_user == state["requesting_user"]:
+        print(
+            f"You ({current_user}) initiated this reboot request.\n"
+            "Run the guardian process (Ctrl+C) to cancel it instead."
+        )
+        sys.exit(1)
+
+    if current_user not in state["eligible_voters"]:
+        print(f"You ({current_user}) are not an eligible voter for this reboot.")
+        sys.exit(1)
+
+    existing = state["votes"].get(current_user)
+    if existing:
+        if existing == action:
+            print(f"You already voted '{action}'.")
+        else:
+            state["votes"][current_user] = action
+            save_state(state)
+            print(f"Vote changed to '{action}'.")
+        return
+
+    state["votes"][current_user] = action
+    save_state(state)
+
+    if action == "yes":
+        print(f"Vote recorded: APPROVED. The reboot will proceed if all others agree or time out.")
+    else:
+        print(f"Vote recorded: OBJECTED. The reboot request will be cancelled.")
+
+
+if __name__ == "__main__":
+    main()
