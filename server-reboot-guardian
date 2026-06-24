@@ -14,6 +14,7 @@ import socket
 import signal
 import pwd
 import glob
+from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
 
@@ -147,7 +148,147 @@ def get_pending_changes():
     return changes
 
 
-def format_banner(requesting_user, hostname, users_map, running_kernel, changes, timeout_secs):
+_SKIP_COMMS = frozenset([
+    "sshd", "login", "init", "systemd", "dbus-daemon", "agetty",
+    "cron", "rsyslogd", "NetworkManager", "polkitd",
+])
+_SHELL_COMMS = frozenset(["bash", "sh", "zsh", "fish", "csh", "tcsh", "dash", "ksh"])
+
+
+def _fmt_mem(kb):
+    if kb >= 1024 * 1024:
+        return f"{kb / 1024 / 1024:.1f}GB"
+    elif kb >= 1024:
+        return f"{kb / 1024:.0f}MB"
+    return f"{kb}KB"
+
+
+def _fmt_elapsed(seconds):
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    elif s < 3600:
+        return f"{s // 60}m"
+    elif s < 86400:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 86400}d{(s % 86400) // 3600:02d}h"
+
+
+def get_workload_summary(users_map):
+    """Return display lines summarising active workloads and hardware status."""
+    lines = []
+
+    # Collect per-user notable processes
+    try:
+        ps_out = subprocess.run(
+            ["ps", "-e", "-o", "user:32,pid,pcpu,rss,etimes,comm,args", "--no-headers"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+    except Exception:
+        return lines
+
+    target = set(users_map.keys())
+    user_notable = defaultdict(list)
+
+    for line in ps_out.splitlines():
+        parts = line.split(None, 6)
+        if len(parts) < 6:
+            continue
+        user = parts[0]
+        if user not in target:
+            continue
+        try:
+            cpu = float(parts[2])
+            mem_kb = int(parts[3])
+            elapsed_s = int(parts[4])
+            comm = parts[5]
+            args = (parts[6] if len(parts) > 6 else comm).strip()
+        except (ValueError, IndexError):
+            continue
+
+        if comm in _SKIP_COMMS:
+            continue
+        if comm in _SHELL_COMMS and cpu < 1.0 and mem_kb < 100 * 1024:
+            continue
+        # Only show processes that actually consume resources or have been running a while
+        if cpu >= 5.0 or mem_kb >= 256 * 1024 or elapsed_s >= 600:
+            user_notable[user].append((cpu, mem_kb, elapsed_s, comm, args))
+
+    for u in user_notable:
+        user_notable[u].sort(reverse=True)
+
+    # Per-user workload lines
+    active_users = [u for u in sorted(target) if user_notable.get(u)]
+    if active_users:
+        lines.append("  ACTIVE WORKLOADS (will be interrupted by reboot):")
+        for user in active_users:
+            procs = user_notable[user]
+            total_cpu = sum(p[0] for p in procs)
+            total_mem = sum(p[1] for p in procs)
+            lines.append(
+                f"    {user:<20} CPU:{total_cpu:5.1f}%  MEM:{_fmt_mem(total_mem)}"
+            )
+            for cpu, mem_kb, elapsed_s, comm, args in procs[:3]:
+                cmd_disp = args[:50] + "..." if len(args) > 50 else args
+                lines.append(
+                    f"      {comm:<15} CPU:{cpu:5.1f}%  MEM:{_fmt_mem(mem_kb):<7}"
+                    f"  up:{_fmt_elapsed(elapsed_s):<7}  {cmd_disp}"
+                )
+    else:
+        lines.append("  ACTIVE WORKLOADS: no significant workloads detected.")
+
+    # Hardware status summary
+    try:
+        load1 = float(open("/proc/loadavg").read().split()[0])
+    except Exception:
+        load1 = 0.0
+    ncpu = os.cpu_count() or 1
+    load_pct = load1 / ncpu * 100
+    cpu_lv = "HIGH" if load_pct >= 80 else "MODERATE" if load_pct >= 50 else "LOW"
+
+    mem_lv = ""
+    try:
+        mi = {}
+        for ln in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = ln.partition(":")
+            k = k.strip()
+            if k in ("MemTotal", "MemAvailable"):
+                mi[k] = int(v.strip().split()[0])
+        total = mi.get("MemTotal", 0)
+        used_pct = (total - mi.get("MemAvailable", 0)) / total * 100 if total else 0
+        mem_lv = "HIGH" if used_pct >= 85 else "MODERATE" if used_pct >= 60 else "LOW"
+        mem_status = f"Memory:{mem_lv}({used_pct:.0f}%)"
+    except Exception:
+        mem_status = "Memory:unknown"
+
+    gpu_status = ""
+    try:
+        gpu_out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if gpu_out:
+            utils = []
+            for x in gpu_out.splitlines():
+                x = x.strip()
+                if x.isdigit():
+                    utils.append(int(x))
+            if utils:
+                max_u = max(utils)
+                gpu_lv = "HIGH" if max_u >= 70 else "MODERATE" if max_u >= 30 else "LOW"
+                gpu_status = f"  GPU:{gpu_lv}({max_u}%)"
+    except Exception:
+        pass
+
+    lines.append("")
+    lines.append(
+        f"  Hardware status: CPU:{cpu_lv}({load_pct:.0f}%)"
+        f"  {mem_status}{gpu_status}"
+    )
+    return lines
+
+
+def format_banner(requesting_user, hostname, users_map, running_kernel, changes, timeout_secs, workload_lines=None):
     other_users = [u for u in users_map if u != requesting_user]
     user_list = ", ".join(sorted(users_map.keys())) if users_map else "none"
 
@@ -172,6 +313,10 @@ def format_banner(requesting_user, hostname, users_map, running_kernel, changes,
         lines.append("  No pending kernel / firmware / package changes detected.")
 
     lines.append("")
+
+    if workload_lines:
+        lines += workload_lines
+        lines.append("")
 
     if other_users:
         lines += [
@@ -349,11 +494,13 @@ def main():
     users_map = get_logged_in_users()
     running_kernel = get_running_kernel()
     changes = get_pending_changes()
+    workload_lines = get_workload_summary(users_map)
 
     timeout_secs = DEFAULT_TIMEOUT_SECS
 
     banner = format_banner(
-        requesting_user, hostname, users_map, running_kernel, changes, timeout_secs
+        requesting_user, hostname, users_map, running_kernel, changes, timeout_secs,
+        workload_lines=workload_lines,
     )
     print(banner)
     broadcast(banner)

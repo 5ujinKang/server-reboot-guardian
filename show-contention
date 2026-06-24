@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""
+show-contention
+Displays which logged-in users are running what programs, with a hardware
+contention analysis (CPU, memory, GPU, disk I/O) to identify workloads that
+would be disrupted by a server reboot.
+
+Usage:
+  show-contention                  # report for all logged-in users
+  show-contention alice bob        # filter to specific users
+  show-contention -n 10            # show up to 10 processes per user
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Low-level helpers
+# ---------------------------------------------------------------------------
+
+def _run(cmd, timeout=10):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout.strip()
+    except Exception:
+        return ""
+
+
+SKIP_COMMS = frozenset([
+    "sshd", "login", "init", "systemd", "dbus-daemon", "agetty", "cron",
+    "rsyslogd", "NetworkManager", "polkitd", "gdm", "xdm", "lightdm",
+    "Xorg", "x11vnc",
+    "ps",                  # transient — always our own data-collection subprocess
+    "command-not-found",   # shell helper, transient
+    "lesspipe",            # shell helper
+    "dircolors",           # shell helper
+])
+
+SHELL_COMMS = frozenset(["bash", "sh", "zsh", "fish", "csh", "tcsh", "dash", "ksh"])
+
+TRIVIAL_COMMS = frozenset([
+    "ps", "grep", "awk", "sed", "cat", "ls", "man", "less", "more",
+    "top", "htop", "vim", "nano", "emacs", "tmux", "screen", "ssh",
+    "sftp", "scp", "tail", "head", "watch",
+])
+
+
+def format_mem(kb):
+    if kb >= 1024 * 1024:
+        return f"{kb / 1024 / 1024:.1f}GB"
+    elif kb >= 1024:
+        return f"{kb / 1024:.0f}MB"
+    return f"{kb}KB"
+
+
+def format_elapsed(seconds):
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    elif s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    elif s < 86400:
+        return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+    return f"{s // 86400}d {(s % 86400) // 3600:02d}h"
+
+
+def truncate(s, n):
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def contention_level(value, low_thresh, high_thresh):
+    if value >= high_thresh:
+        return "HIGH"
+    elif value >= low_thresh:
+        return "MODERATE"
+    return "LOW"
+
+
+# ---------------------------------------------------------------------------
+# Data collection
+# ---------------------------------------------------------------------------
+
+def get_cpu_count():
+    return os.cpu_count() or 1
+
+
+def get_load_avg():
+    try:
+        with open("/proc/loadavg") as f:
+            p = f.read().split()
+            return float(p[0]), float(p[1]), float(p[2])
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+
+def get_memory_info():
+    result = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            k = k.strip()
+            if k in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"):
+                result[k] = int(v.strip().split()[0])
+    except Exception:
+        pass
+    return result
+
+
+def get_logged_in_users():
+    try:
+        out = subprocess.run(["who"], capture_output=True, text=True).stdout
+        users = set()
+        for line in out.splitlines():
+            parts = line.split()
+            if parts:
+                users.add(parts[0])
+        return sorted(users)
+    except Exception:
+        return []
+
+
+def get_user_processes(target_users):
+    """Return {username: [proc_dict, ...]} sorted by CPU desc."""
+    out = _run(
+        ["ps", "-e", "-o", "user:32,pid,pcpu,rss,etimes,comm,args", "--no-headers"],
+        timeout=15,
+    )
+    target = set(target_users)
+    user_procs = defaultdict(list)
+
+    for line in out.splitlines():
+        parts = line.split(None, 6)
+        if len(parts) < 6:
+            continue
+        user = parts[0]
+        if target and user not in target:
+            continue
+        try:
+            pid = int(parts[1])
+            cpu = float(parts[2])
+            mem_kb = int(parts[3])
+            elapsed_s = int(parts[4])
+            comm = parts[5]
+            args = (parts[6] if len(parts) > 6 else comm).strip()
+        except (ValueError, IndexError):
+            continue
+
+        if comm in SKIP_COMMS:
+            continue
+        # Kernel helpers / PAM workers show as "(name)" — always skip
+        if comm.startswith("(") and comm.endswith(")"):
+            continue
+        if (comm in SHELL_COMMS or comm in TRIVIAL_COMMS) and cpu < 1.0 and mem_kb < 100 * 1024:
+            continue
+
+        user_procs[user].append(
+            {"pid": pid, "cpu": cpu, "mem_kb": mem_kb,
+             "elapsed_s": elapsed_s, "comm": comm, "args": args}
+        )
+
+    for u in user_procs:
+        user_procs[u].sort(key=lambda p: (-p["cpu"], -p["mem_kb"]))
+
+    return dict(user_procs)
+
+
+def get_gpu_info():
+    """Return GPU contention data from nvidia-smi, or None if not available."""
+    try:
+        gpu_out = _run(
+            ["nvidia-smi",
+             "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            timeout=10,
+        )
+        if not gpu_out:
+            return None
+
+        gpus = []
+        for line in gpu_out.splitlines():
+            cols = [c.strip() for c in line.split(",")]
+            if len(cols) < 5:
+                continue
+            try:
+                gpus.append({
+                    "index": int(cols[0]),
+                    "name": cols[1],
+                    "util_pct": int(cols[2]),
+                    "mem_used_mb": int(cols[3]),
+                    "mem_total_mb": int(cols[4]),
+                })
+            except ValueError:
+                pass
+
+        if not gpus:
+            return None
+
+        proc_out = _run(
+            ["nvidia-smi",
+             "--query-compute-apps=pid,used_memory",
+             "--format=csv,noheader,nounits"],
+            timeout=10,
+        )
+        gpu_procs = []
+        for line in proc_out.splitlines():
+            cols = [c.strip() for c in line.split(",")]
+            if len(cols) >= 2:
+                try:
+                    gpu_procs.append({"pid": int(cols[0]), "mem_mb": int(cols[1])})
+                except ValueError:
+                    pass
+
+        return {"gpus": gpus, "processes": gpu_procs}
+
+    except FileNotFoundError:
+        return None
+
+
+def get_iostat_devices():
+    """Return per-device I/O utilization via iostat (1-second sample)."""
+    try:
+        out = _run(["iostat", "-x", "-k", "1", "1"], timeout=20)
+        devices = []
+        in_section = False
+        for line in out.splitlines():
+            if line.startswith("Device"):
+                in_section = True
+                continue
+            if not in_section or not line.strip():
+                continue
+            parts = line.split()
+            if not parts or parts[0].startswith(("loop", "ram")):
+                continue
+            try:
+                devices.append({
+                    "dev": parts[0],
+                    "read_kbs": float(parts[2]),
+                    "write_kbs": float(parts[3]),
+                    "util_pct": float(parts[-1]),
+                })
+            except (ValueError, IndexError):
+                pass
+        return devices
+    except FileNotFoundError:
+        return []
+
+
+def get_pid_to_user():
+    """Build a pid->username map for all running processes."""
+    pid_user = {}
+    try:
+        out = _run(["ps", "-e", "-o", "pid,user", "--no-headers"])
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    pid_user[int(parts[0])] = parts[1]
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return pid_user
+
+
+def get_current_user():
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return os.environ.get("USER", "")
+
+
+# ---------------------------------------------------------------------------
+# Verdict: is the server available for me?
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate a process is just an idle editor/dev-tool session,
+# not real compute work.
+_IDLE_COMMS = frozenset(["tmux:", "tmux", "screen", "(sd-pam)", "dbus-launch"])
+_IDLE_ARG_SUBSTRINGS = (
+    ".vscode-server",   # VS Code remote server
+    "code-server",      # code-server
+    "jetbrains",        # JetBrains gateway
+    "idea",             # IntelliJ
+    ".cursor-server",   # Cursor IDE
+)
+
+# Commands that are clearly compute work even at moderate CPU
+_COMPUTE_COMMS = frozenset([
+    "python", "python3", "python2",
+    "R", "Rscript",
+    "julia",
+    "matlab",
+    "octave",
+    "java",
+    "spark-submit", "pyspark",
+    "make", "cmake", "ninja",
+    "gcc", "g++", "clang", "clang++", "cc", "c++",
+    "cargo", "rustc",
+    "go",
+    "nvcc",
+    "mpirun", "mpiexec", "srun", "sbatch",
+    "singularity", "apptainer",
+    "torch", "tensorflow",
+])
+
+
+def _is_idle(proc):
+    """Return True if the process is an idle editor/shell/helper — not compute work."""
+    comm = proc["comm"]
+    args = proc["args"]
+
+    if comm in _IDLE_COMMS or "sd-pam" in comm:
+        return True
+    if comm in SHELL_COMMS and proc["cpu"] < 5.0:
+        return True
+    # VS Code / IDE server (node processes that serve the editor, not compute)
+    if comm in ("node", "node.js") and any(s in args for s in _IDLE_ARG_SUBSTRINGS):
+        return True
+    # code-XXXXXXX helper processes (VS Code extension host names)
+    if comm.startswith("code-") and proc["cpu"] < 5.0:
+        return True
+    return False
+
+
+def _is_meaningful(proc, gpu_pid_set):
+    """Return True if this process is doing real compute work."""
+    if _is_idle(proc):
+        return False
+
+    cpu = proc["cpu"]
+    mem_kb = proc["mem_kb"]
+    elapsed = proc["elapsed_s"]
+    comm = proc["comm"]
+
+    # Any GPU allocation = meaningful by definition
+    if proc["pid"] in gpu_pid_set:
+        return True
+
+    # Ignore brand-new processes (elapsed < 5s): instantaneous CPU readings are
+    # unreliable at startup and catch transient shell helpers like command-not-found.
+    if elapsed < 5:
+        return False
+
+    # Known compute command with sustained CPU
+    if comm in _COMPUTE_COMMS and cpu >= 5.0:
+        return True
+
+    # Heavy CPU on any non-idle process
+    if cpu >= 20.0:
+        return True
+
+    # Long-running with significant memory loaded + active CPU
+    # (e.g. training job between epochs, loaded R/Python dataset)
+    if elapsed >= 600 and mem_kb >= 1024 * 1024 and cpu >= 1.0:
+        return True
+
+    return False
+
+
+def assess_others(current_user, user_procs, ncpu, gpu_info):
+    """
+    Compare other users' workloads against the current user.
+
+    Returns:
+        verdict:  'CLEAR' | 'CAUTION' | 'BUSY'
+        lines:    list of strings describing what others are doing
+        idle_blurb: short phrase summarising idle users, e.g. "hjx (VSCode), zlr (tmux)"
+    """
+    gpu_pid_set = set()
+    if gpu_info:
+        gpu_pid_set = {gp["pid"] for gp in gpu_info.get("processes", [])}
+
+    busy_users = {}   # user -> [meaningful proc, ...]
+    idle_users = {}   # user -> short label for what they're doing
+
+    for user, procs in user_procs.items():
+        if user == current_user:
+            continue
+        meaningful = [p for p in procs if _is_meaningful(p, gpu_pid_set)]
+        if meaningful:
+            busy_users[user] = meaningful
+        else:
+            # Summarise what they appear to be doing (for idle description)
+            dominant = procs[0] if procs else None
+            if dominant:
+                if any(".vscode-server" in p["args"] or p["comm"].startswith("code-") for p in procs):
+                    label = "VSCode"
+                elif any(p["comm"] in ("tmux:", "tmux", "screen") for p in procs):
+                    label = "tmux/idle"
+                elif any(p["comm"] in SHELL_COMMS for p in procs):
+                    label = "shell/idle"
+                else:
+                    label = dominant["comm"]
+                idle_users[user] = label
+            else:
+                idle_users[user] = "idle"
+
+    lines = []
+    verdict = "CLEAR"
+
+    if busy_users:
+        # Score severity
+        total_other_cpu = sum(
+            sum(p["cpu"] for p in ps) for ps in busy_users.values()
+        )
+        has_gpu = any(
+            any(p["pid"] in gpu_pid_set for p in ps)
+            for ps in busy_users.values()
+        )
+        # On a large server, scale by cores; cap so even 1-core job on huge server matters
+        cpu_score = total_other_cpu / max(ncpu, 1)  # fraction of server
+        if has_gpu or total_other_cpu >= ncpu * 60 or cpu_score >= 0.6:
+            verdict = "BUSY"
+        else:
+            verdict = "CAUTION"
+
+        for user, procs in sorted(busy_users.items()):
+            total_cpu = sum(p["cpu"] for p in procs)
+            total_mem = sum(p["mem_kb"] for p in procs)
+            top = procs[0]
+            parts = [
+                f"CPU:{total_cpu:.0f}%",
+                f"MEM:{format_mem(total_mem)}",
+            ]
+            if any(p["pid"] in gpu_pid_set for p in procs):
+                parts.append("GPU:active")
+            desc = "  ".join(parts)
+            cmd = truncate(top["args"], 42)
+            lines.append(
+                f"  {user}: {desc}  [{top['comm']} — up {format_elapsed(top['elapsed_s'])}]  {cmd}"
+            )
+
+    idle_blurb = ""
+    if idle_users:
+        idle_blurb = ", ".join(f"{u} ({lbl})" for u, lbl in sorted(idle_users.items()))
+
+    return verdict, lines, idle_blurb
+
+
+def _verdict_box(verdict, detail_lines, idle_blurb, W):
+    """Render the top-of-report verdict box."""
+    ICONS = {"CLEAR": "✓", "CAUTION": "!", "BUSY": "✗"}
+    icon = ICONS.get(verdict, "?")
+
+    out = []
+    if verdict == "CLEAR":
+        if idle_blurb:
+            msg = f"CLEAR — no compute jobs from others  ({idle_blurb})"
+        else:
+            msg = "CLEAR — no other users running active workloads"
+    elif verdict == "CAUTION":
+        msg = "CAUTION — others have active workloads, check before starting heavy jobs"
+    else:
+        msg = "BUSY — server is under significant load from other users"
+
+    border = "=" * W
+    inner  = f"  {icon}  {msg}"
+    # Pad to W
+    pad = W - len(inner) - 1
+    inner  = inner + (" " * max(pad, 0))
+
+    out.append(border)
+    out.append(inner)
+    if detail_lines:
+        for dl in detail_lines:
+            out.append(dl)
+    out.append(border)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+def build_report(users=None, top_n=5, skip_disk=False):
+    hostname = socket.gethostname()
+    now = datetime.now()
+    ncpu = get_cpu_count()
+    load1, load5, load15 = get_load_avg()
+    mem = get_memory_info()
+    current_user = get_current_user()
+
+    logged_in = get_logged_in_users()
+    if users:
+        logged_in = [u for u in logged_in if u in users]
+        missing = [u for u in users if u not in logged_in]
+        if missing:
+            print(f"Note: user(s) not currently logged in: {', '.join(missing)}", file=sys.stderr)
+
+    user_procs = get_user_processes(logged_in)
+    gpu = get_gpu_info()
+    io_devs = [] if skip_disk else get_iostat_devices()
+
+    W = 72
+    out = []
+
+    # ---- Verdict (top of report) ----
+    verdict, verdict_detail, idle_blurb = assess_others(current_user, user_procs, ncpu, gpu)
+    out.append("")
+    out += _verdict_box(verdict, verdict_detail, idle_blurb, W)
+    out.append("")
+
+    out.append("=" * W)
+    out.append("  USER PROCESS & HARDWARE CONTENTION REPORT")
+    out.append(f"  {hostname}  |  {now.strftime('%Y-%m-%d %H:%M:%S')}  |  {ncpu} CPUs")
+    out.append("=" * W)
+
+    # System overview
+    load_pct = load1 / ncpu * 100
+    out.append(
+        f"  Load avg : {load1:.1f}, {load5:.1f}, {load15:.1f}"
+        f"  ({load_pct:.0f}% of {ncpu} CPUs)"
+    )
+    if mem:
+        total_kb = mem.get("MemTotal", 0)
+        avail_kb = mem.get("MemAvailable", 0)
+        used_kb = total_kb - avail_kb
+        used_pct = used_kb / total_kb * 100 if total_kb else 0
+        out.append(
+            f"  Memory   : {format_mem(used_kb)} / {format_mem(total_kb)}"
+            f" ({used_pct:.0f}% used)"
+        )
+        sw_total = mem.get("SwapTotal", 0)
+        sw_used = sw_total - mem.get("SwapFree", 0)
+        if sw_total > 0:
+            sw_pct = sw_used / sw_total * 100
+            out.append(
+                f"  Swap     : {format_mem(sw_used)} / {format_mem(sw_total)}"
+                f" ({sw_pct:.0f}% used)"
+            )
+    out.append("")
+
+    # ---- Per-user workloads ----
+    out.append("  ACTIVE USER WORKLOADS")
+    out.append("  " + "-" * (W - 4))
+
+    if not logged_in:
+        out.append("  No users currently logged in.")
+    else:
+        for user in sorted(logged_in):
+            procs = user_procs.get(user, [])
+            total_cpu = sum(p["cpu"] for p in procs)
+            total_mem = sum(p["mem_kb"] for p in procs)
+
+            out.append(
+                f"  {user:<22} {len(procs)} proc(s)"
+                f"   CPU:{total_cpu:6.1f}%   MEM:{format_mem(total_mem)}"
+            )
+
+            # Notable = high CPU, high memory, or long-running with real footprint
+            notable = [
+                p for p in procs
+                if p["cpu"] >= 5.0
+                or p["mem_kb"] >= 256 * 1024
+                or (p["elapsed_s"] >= 600 and p["mem_kb"] >= 50 * 1024)
+            ]
+            if not notable:
+                notable = procs[:min(3, len(procs))]
+
+            for p in notable[:top_n]:
+                out.append(
+                    f"    PID {p['pid']:<8} {p['comm']:<15}"
+                    f" CPU:{p['cpu']:5.1f}%"
+                    f"  MEM:{format_mem(p['mem_kb']):<7}"
+                    f"  up:{format_elapsed(p['elapsed_s']):<10}"
+                    f"  {truncate(p['args'], 46)}"
+                )
+
+            if not procs:
+                out.append("    (no resource-consuming processes detected)")
+            out.append("")
+
+    # ---- Contention analysis ----
+    out.append("  HARDWARE CONTENTION ANALYSIS")
+    out.append("  " + "-" * (W - 4))
+
+    # CPU
+    cpu_lv = contention_level(load_pct, 50, 80)
+    out.append(f"  CPU  [{cpu_lv}]")
+    out.append(f"    Load {load1:.1f} on {ncpu} CPUs = {load_pct:.0f}% utilization")
+    if user_procs:
+        per_user_cpu = sorted(
+            [(u, sum(p["cpu"] for p in ps)) for u, ps in user_procs.items()],
+            key=lambda x: -x[1],
+        )
+        for u, c in per_user_cpu:
+            if c > 0:
+                bar = "#" * int(c / (ncpu * 100) * 20)
+                out.append(f"    {u:<20} {c:6.1f}%  [{bar:<20}]")
+        if len(per_user_cpu) > 1 and sum(c for _, c in per_user_cpu) > ncpu * 80:
+            out.append("    *** Multiple users are competing for CPU capacity ***")
+    out.append("")
+
+    # Memory
+    if mem:
+        total_kb = mem.get("MemTotal", 0)
+        avail_kb = mem.get("MemAvailable", 0)
+        used_kb = total_kb - avail_kb
+        used_pct = used_kb / total_kb * 100 if total_kb else 0
+        mem_lv = contention_level(used_pct, 60, 85)
+        out.append(f"  Memory  [{mem_lv}]")
+        out.append(f"    {format_mem(used_kb)} / {format_mem(total_kb)} ({used_pct:.0f}%)")
+
+        if user_procs:
+            per_user_mem = sorted(
+                [(u, sum(p["mem_kb"] for p in ps)) for u, ps in user_procs.items()],
+                key=lambda x: -x[1],
+            )
+            for u, mk in per_user_mem:
+                if mk > 0:
+                    out.append(f"    {u:<20} ~{format_mem(mk)}")
+
+        sw_total = mem.get("SwapTotal", 0)
+        sw_used = sw_total - mem.get("SwapFree", 0)
+        if sw_total > 0 and sw_used > 0:
+            sw_pct = sw_used / sw_total * 100
+            out.append(
+                f"    Swap in use: {format_mem(sw_used)} ({sw_pct:.0f}%)"
+                " — processes may have paged-out state"
+            )
+        out.append("")
+
+    # GPU
+    if gpu:
+        gpu_list = gpu["gpus"]
+        gpu_procs_list = gpu["processes"]
+        max_util = max((g["util_pct"] for g in gpu_list), default=0)
+        gpu_lv = contention_level(max_util, 30, 70)
+        out.append(f"  GPU  [{gpu_lv}]")
+
+        for g in gpu_list:
+            mem_pct = g["mem_used_mb"] / g["mem_total_mb"] * 100 if g["mem_total_mb"] else 0
+            out.append(
+                f"    GPU {g['index']} {g['name']}:"
+                f" util {g['util_pct']}%"
+                f"  mem {g['mem_used_mb']}MB / {g['mem_total_mb']}MB ({mem_pct:.0f}%)"
+            )
+
+        if gpu_procs_list:
+            pid_user = get_pid_to_user()
+            for u, ps in user_procs.items():
+                for p in ps:
+                    pid_user.setdefault(p["pid"], u)
+
+            by_user = defaultdict(int)
+            for gp in gpu_procs_list:
+                u = pid_user.get(gp["pid"], f"pid:{gp['pid']}")
+                by_user[u] += gp["mem_mb"]
+
+            for u, mb in sorted(by_user.items(), key=lambda x: -x[1]):
+                out.append(f"    {u:<20} {mb}MB GPU memory allocated")
+
+            if len(by_user) > 1:
+                out.append("    *** Multiple users have active GPU allocations ***")
+    else:
+        out.append("  GPU  [N/A]  (nvidia-smi not found)")
+    out.append("")
+
+    # Disk I/O
+    real_devs = [d for d in io_devs if not d["dev"].startswith(("loop", "ram"))]
+    if real_devs:
+        max_util = max((d["util_pct"] for d in real_devs), default=0)
+        io_lv = contention_level(max_util, 30, 70)
+        out.append(f"  Disk I/O  [{io_lv}]")
+        for d in sorted(real_devs, key=lambda x: -x["util_pct"])[:4]:
+            out.append(
+                f"    {d['dev']:<14}"
+                f" util:{d['util_pct']:5.1f}%"
+                f"  read:{d['read_kbs']:6.0f}kB/s"
+                f"  write:{d['write_kbs']:6.0f}kB/s"
+            )
+        out.append("")
+    else:
+        out.append("  Disk I/O  (iostat not available or nothing running)")
+        out.append("")
+
+    out.append("=" * W)
+    out.append("")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Show which logged-in users are running what programs, and identify "
+            "hardware contention that would be disrupted by a server reboot."
+        ),
+        epilog="Processes shown: CPU >= 5%, MEM >= 256MB, or running >= 10 min.",
+    )
+    parser.add_argument(
+        "users", nargs="*",
+        help="Filter to specific users (default: all logged-in users)",
+    )
+    parser.add_argument(
+        "-n", "--top", type=int, default=5, metavar="N",
+        help="Max processes to show per user (default: 5)",
+    )
+    parser.add_argument(
+        "--no-disk", action="store_true",
+        help="Skip disk I/O check (faster, good for login hooks)",
+    )
+    args = parser.parse_args()
+
+    print(build_report(users=args.users or None, top_n=args.top, skip_disk=args.no_disk))
+
+
+if __name__ == "__main__":
+    main()

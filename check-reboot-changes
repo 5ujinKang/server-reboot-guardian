@@ -13,8 +13,10 @@ shutdown) is also consulted when available for a before/after comparison.
 import json
 import os
 import pwd
+import socket
 import subprocess
 import sys
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -233,10 +235,205 @@ def diff_snapshots(old: dict, new: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Login-time contention summary
+# ---------------------------------------------------------------------------
+
+_SKIP_COMMS = frozenset([
+    "sshd", "login", "init", "systemd", "dbus-daemon", "agetty",
+    "cron", "rsyslogd", "NetworkManager", "polkitd",
+])
+_SHELL_COMMS = frozenset(["bash", "sh", "zsh", "fish", "csh", "tcsh", "dash", "ksh"])
+_TRIVIAL_COMMS = frozenset([
+    "ps", "grep", "awk", "sed", "cat", "ls", "man", "less", "more",
+    "top", "htop", "vim", "nano", "emacs", "tmux", "screen",
+    "ssh", "sftp", "scp", "tail", "head", "watch",
+])
+
+
+def _fmt_mem(kb: int) -> str:
+    if kb >= 1024 * 1024:
+        return f"{kb / 1024 / 1024:.1f}GB"
+    elif kb >= 1024:
+        return f"{kb / 1024:.0f}MB"
+    return f"{kb}KB"
+
+
+def _fmt_elapsed(s: int) -> str:
+    if s < 60:
+        return f"{s}s"
+    elif s < 3600:
+        return f"{s // 60}m"
+    elif s < 86400:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 86400}d{(s % 86400) // 3600:02d}h"
+
+
+def _get_load_pct() -> tuple[float, int]:
+    try:
+        load1 = float(open("/proc/loadavg").read().split()[0])
+    except Exception:
+        load1 = 0.0
+    ncpu = os.cpu_count() or 1
+    return load1, ncpu
+
+
+def _get_mem_pct() -> tuple[int, int]:
+    """Return (used_kb, total_kb)."""
+    try:
+        mi: dict[str, int] = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            k = k.strip()
+            if k in ("MemTotal", "MemAvailable"):
+                mi[k] = int(v.strip().split()[0])
+        total = mi.get("MemTotal", 0)
+        used = total - mi.get("MemAvailable", 0)
+        return used, total
+    except Exception:
+        return 0, 0
+
+
+def print_login_contention_summary() -> None:
+    """Print a brief server-load and active-workload summary at every login."""
+    hostname = socket.gethostname()
+    load1, ncpu = _get_load_pct()
+    load_pct = load1 / ncpu * 100
+    used_kb, total_kb = _get_mem_pct()
+    mem_pct = used_kb / total_kb * 100 if total_kb else 0
+
+    load_lv = "HIGH" if load_pct >= 80 else "MODERATE" if load_pct >= 50 else "LOW"
+    mem_lv  = "HIGH" if mem_pct  >= 85 else "MODERATE" if mem_pct  >= 60 else "LOW"
+
+    # GPU (optional, skip if not available)
+    gpu_line = ""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if out:
+            totals = [l.split(",") for l in out.splitlines() if l.strip()]
+            utils = []
+            for cols in totals:
+                if len(cols) >= 1:
+                    try:
+                        utils.append(int(cols[0].strip()))
+                    except ValueError:
+                        pass
+            if utils:
+                max_u = max(utils)
+                gpu_lv = "HIGH" if max_u >= 70 else "MODERATE" if max_u >= 30 else "LOW"
+                gpu_line = f"  GPU:{gpu_lv}({max_u}%)"
+    except Exception:
+        pass
+
+    # Collect who's running what — limit to currently logged-in users
+    logged_in: set[str] = set()
+    try:
+        who_out = subprocess.run(["who"], capture_output=True, text=True).stdout
+        for line in who_out.splitlines():
+            parts = line.split()
+            if parts:
+                logged_in.add(parts[0])
+    except Exception:
+        pass
+
+    user_summary: dict[str, dict] = {}  # user -> {cpu, mem_kb, top_proc}
+    if logged_in:
+        try:
+            ps_out = subprocess.run(
+                ["ps", "-e", "-o", "user:32,pid,pcpu,rss,etimes,comm,args", "--no-headers"],
+                capture_output=True, text=True, timeout=15,
+            ).stdout
+
+            raw: dict[str, list] = defaultdict(list)
+            for line in ps_out.splitlines():
+                parts = line.split(None, 6)
+                if len(parts) < 6:
+                    continue
+                user = parts[0]
+                if user not in logged_in:
+                    continue
+                try:
+                    cpu      = float(parts[2])
+                    mem_kb   = int(parts[3])
+                    elapsed  = int(parts[4])
+                    comm     = parts[5]
+                    args     = (parts[6] if len(parts) > 6 else comm).strip()
+                except (ValueError, IndexError):
+                    continue
+
+                if comm in _SKIP_COMMS:
+                    continue
+                if (comm in _SHELL_COMMS or comm in _TRIVIAL_COMMS) and cpu < 1.0 and mem_kb < 100 * 1024:
+                    continue
+                if cpu >= 5.0 or mem_kb >= 256 * 1024 or elapsed >= 600:
+                    raw[user].append((cpu, mem_kb, elapsed, comm, args))
+
+            for u, procs in raw.items():
+                procs.sort(reverse=True)
+                top = procs[0]
+                user_summary[u] = {
+                    "cpu":    sum(p[0] for p in procs),
+                    "mem_kb": sum(p[1] for p in procs),
+                    "top_comm": top[3],
+                    "top_args": top[4],
+                    "top_elapsed": top[2],
+                }
+        except Exception:
+            pass
+
+    # Print
+    print()
+    print("=" * 68)
+    print(f"  SERVER STATUS — {hostname}")
+    print("=" * 68)
+    print(
+        f"  Load   : {load1:.1f} / {ncpu} CPUs  [{load_lv}]  ({load_pct:.0f}% utilization)"
+    )
+    print(
+        f"  Memory : {_fmt_mem(used_kb)} / {_fmt_mem(total_kb)}"
+        f"  [{mem_lv}]  ({mem_pct:.0f}% used){gpu_line}"
+    )
+
+    if user_summary:
+        print()
+        print("  ACTIVE WORKLOADS:")
+        for user in sorted(user_summary):
+            info = user_summary[user]
+            cmd_disp = info["top_args"][:44] + "..." if len(info["top_args"]) > 44 else info["top_args"]
+            print(
+                f"    {user:<20} CPU:{info['cpu']:5.1f}%  MEM:{_fmt_mem(info['mem_kb']):<7}"
+                f"  [{info['top_comm']} — up {_fmt_elapsed(info['top_elapsed'])}]  {cmd_disp}"
+            )
+        if load_lv in ("MODERATE", "HIGH") or mem_lv in ("MODERATE", "HIGH"):
+            print()
+            print("  Note: server is under load — consider checking with 'show-contention'")
+    else:
+        print()
+        print("  No significant workloads running.")
+
+    print("=" * 68)
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
+    args = sys.argv[1:]
+
+    # --summary-only: contention block only, exit (used by /etc/update-motd.d/)
+    if "--summary-only" in args:
+        print_login_contention_summary()
+        return
+
+    # --reboot-check-only: skip contention block (MOTD already showed it),
+    # only print the post-reboot hardware diff if a reboot happened.
+    reboot_check_only = "--reboot-check-only" in args
+
     username = pwd.getpwuid(os.getuid()).pw_name
     boot_time = get_last_boot_time()
     prev_login = get_previous_login_time(username)
@@ -257,8 +454,12 @@ def main():
     # Collect current hardware state
     current = collect_hardware_snapshot()
 
+    # Contention summary: show always unless MOTD already showed it
+    if not reboot_check_only:
+        print_login_contention_summary()
+
     if not rebooted:
-        # Silently update snapshot and exit — nothing to report
+        # Update snapshot and exit — no reboot to report
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
         SNAPSHOT_FILE.write_text(json.dumps(current, indent=2))
         return

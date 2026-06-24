@@ -8,8 +8,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUARDIAN_BIN="/usr/local/sbin/server-reboot-guardian"
 VOTE_BIN="/usr/local/bin/reboot-vote"
 CHECK_BIN="/usr/local/bin/check-reboot-changes"
+CONTENTION_BIN="/usr/local/bin/show-contention"
 SUDOERS_FILE="/etc/sudoers.d/server-reboot-guardian"
 PROFILE_SCRIPT="/etc/profile.d/reboot-check.sh"
+MOTD_SCRIPT="/etc/update-motd.d/90-server-contention"
 SNAPSHOT_DIR="/var/lib/server-reboot-guardian"
 
 if [[ $EUID -ne 0 ]]; then
@@ -22,6 +24,7 @@ echo "Installing server-reboot-guardian..."
 install -o root -g root -m 0755 "$SCRIPT_DIR/server-reboot-guardian"  "$GUARDIAN_BIN"
 install -o root -g root -m 0755 "$SCRIPT_DIR/reboot-vote"              "$VOTE_BIN"
 install -o root -g root -m 0755 "$SCRIPT_DIR/check-reboot-changes"     "$CHECK_BIN"
+install -o root -g root -m 0755 "$SCRIPT_DIR/show-contention"          "$CONTENTION_BIN"
 
 # Persistent directory for pre-reboot hardware snapshots (world-readable)
 mkdir -p "$SNAPSHOT_DIR"
@@ -31,6 +34,7 @@ echo "Installed binaries:"
 echo "  $GUARDIAN_BIN"
 echo "  $VOTE_BIN"
 echo "  $CHECK_BIN"
+echo "  $CONTENTION_BIN"
 
 # Write sudoers drop-in:
 #   - sudo reboot (and common aliases) → run the guardian instead
@@ -68,11 +72,23 @@ else
     echo "Symlink $SYMLINK already exists — skipping."
 fi
 
-# Install login-time reboot check for all interactive shells
+# MOTD integration: show contention summary in the SSH welcome screen
+# Ubuntu runs /etc/update-motd.d/ scripts as root via PAM at every login.
+cat > "$MOTD_SCRIPT" << 'MOTD_EOF'
+#!/bin/sh
+# server-reboot-guardian: show server load and active workloads at login
+exec /usr/local/bin/check-reboot-changes --summary-only 2>/dev/null
+MOTD_EOF
+chmod 0755 "$MOTD_SCRIPT"
+echo "MOTD script installed: $MOTD_SCRIPT"
+
+# /etc/profile.d/ hook: runs the FULL check (reboot detection + hardware diff)
+# as the user after the MOTD. Suppresses the contention block since MOTD
+# already showed it; only the reboot-hardware-diff section will appear.
 cat > "$PROFILE_SCRIPT" << 'PROFILE_EOF'
-# server-reboot-guardian: notify users if server rebooted since last login
+# server-reboot-guardian: show post-reboot hardware changes at login
 if [ -t 1 ] && command -v check-reboot-changes >/dev/null 2>&1; then
-    check-reboot-changes
+    check-reboot-changes --reboot-check-only
 fi
 PROFILE_EOF
 chmod 0644 "$PROFILE_SCRIPT"
@@ -80,7 +96,8 @@ echo "Login hook installed: $PROFILE_SCRIPT"
 
 echo ""
 echo "Done."
-echo "  sudo reboot         → triggers the guardian (notify + vote)"
-echo "  reboot-vote yes|no  → cast a vote on a pending reboot"
-echo "  check-reboot-changes → run manually to see post-reboot hardware diff"
-echo "  (also runs automatically at each login via $PROFILE_SCRIPT)"
+echo "  sudo reboot          → triggers the guardian (notify + vote)"
+echo "  reboot-vote yes|no   → cast a vote on a pending reboot"
+echo "  show-contention      → show who is running what + hardware contention"
+echo "  check-reboot-changes → run manually to see full post-reboot hardware diff"
+echo "  (contention summary shown at every SSH login via $MOTD_SCRIPT)"
