@@ -8,7 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUARDIAN_BIN="/usr/local/sbin/server-reboot"
 VOTE_BIN="/usr/local/bin/reboot-vote"
 CHECK_BIN="/usr/local/bin/check-reboot-changes"
-CONTENTION_BIN="/usr/local/bin/show-contention"
+INSTALLER_USER="${SUDO_USER:-}"
+INSTALLER_HOME="$(getent passwd "$INSTALLER_USER" | cut -d: -f6 2>/dev/null || echo "")"
+CONTENTION_BIN="${INSTALLER_HOME:+$INSTALLER_HOME/.local/bin}/show-contention"
 LOCK_BIN="/usr/local/bin/server-lock"
 SHELL_LIB_DIR="/usr/local/lib/server-manager"
 SHELL_LIB="$SHELL_LIB_DIR/shell-integration.bash"
@@ -28,7 +30,13 @@ echo "Installing server-manager..."
 install -o root -g root -m 0755 "$SCRIPT_DIR/server-reboot"   "$GUARDIAN_BIN"
 install -o root -g root -m 0755 "$SCRIPT_DIR/reboot-vote"              "$VOTE_BIN"
 install -o root -g root -m 0755 "$SCRIPT_DIR/check-reboot-changes"     "$CHECK_BIN"
-install -o root -g root -m 0755 "$SCRIPT_DIR/show-contention"          "$CONTENTION_BIN"
+if [[ -n "$INSTALLER_USER" && -n "$INSTALLER_HOME" ]]; then
+    mkdir -p "$INSTALLER_HOME/.local/bin"
+    install -o "$INSTALLER_USER" -g "$INSTALLER_USER" -m 0700 "$SCRIPT_DIR/show-contention" "$CONTENTION_BIN"
+else
+    echo "Warning: could not determine calling user — skipping show-contention install." >&2
+    echo "  Install manually: install -m 0700 show-contention ~/.local/bin/show-contention" >&2
+fi
 install -o root -g root -m 0755 "$SCRIPT_DIR/server-lock"              "$LOCK_BIN"
 
 # Persistent data directory for snapshots (world-readable)
@@ -117,7 +125,7 @@ echo ""
 echo "Done."
 echo "  sudo reboot          → triggers the guardian (notify + vote)"
 echo "  reboot-vote yes|no   → cast a vote on a pending reboot"
-echo "  show-contention      → who is running what + hardware contention"
+echo "  show-contention      → who is running what + hardware contention (owner-only: $CONTENTION_BIN)"
 echo "  server-lock-on       → announce performance-critical work"
 echo "  server-lock-off      → clear your lock"
 echo "  server-lock status   → show all active locks"
