@@ -22,7 +22,7 @@ VOTE_DIR = "/run/server-reboot-vote"
 VOTE_FILE = f"{VOTE_DIR}/vote_state.json"
 REAL_REBOOT = "/sbin/reboot"
 DEFAULT_TIMEOUT_SECS = 300  # 5 minutes
-PRE_REBOOT_SNAPSHOT_DIR  = Path("/var/lib/server-reboot-guardian")
+PRE_REBOOT_SNAPSHOT_DIR  = Path("/var/lib/server-manager")
 PRE_REBOOT_SNAPSHOT_FILE = PRE_REBOOT_SNAPSHOT_DIR / "pre_reboot_snapshot.json"
 
 
@@ -409,7 +409,7 @@ def _run(cmd, timeout=8):
 
 
 def save_pre_reboot_snapshot():
-    """Save a hardware snapshot to /var/lib/server-reboot-guardian/ before shutdown."""
+    """Save a hardware snapshot to /var/lib/server-manager/ before shutdown."""
     snap = {}
     snap["kernel"] = _run(["uname", "-r"])
 

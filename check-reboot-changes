@@ -5,8 +5,8 @@ Run at login (add to ~/.bash_profile or /etc/profile.d/reboot-check.sh) to
 detect whether the server was rebooted since your last session and show any
 hardware changes.
 
-Snapshot stored per-user in ~/.cache/server-reboot-guardian/hw_snapshot.json
-A system-wide pre-reboot snapshot (written by server-reboot-guardian before
+Snapshot stored per-user in ~/.cache/server-manager/hw_snapshot.json
+A system-wide pre-reboot snapshot (written by server-manager before
 shutdown) is also consulted when available for a before/after comparison.
 """
 
@@ -20,9 +20,36 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-SYSTEM_PRE_REBOOT_SNAPSHOT = Path("/var/lib/server-reboot-guardian/pre_reboot_snapshot.json")
-SNAPSHOT_DIR  = Path.home() / ".cache" / "server-reboot-guardian"
+SYSTEM_PRE_REBOOT_SNAPSHOT = Path("/var/lib/server-manager/pre_reboot_snapshot.json")
+SNAPSHOT_DIR  = Path.home() / ".cache" / "server-manager"
 SNAPSHOT_FILE = SNAPSHOT_DIR / "hw_snapshot.json"
+
+_LOCK_DIRS = [
+    Path("/var/lib/server-manager/locks"),
+    Path("/tmp/server-guardian-locks"),
+]
+
+
+def read_server_locks() -> list[dict]:
+    seen: set[str] = set()
+    locks: list[dict] = []
+    for d in _LOCK_DIRS:
+        if not d.exists():
+            continue
+        for p in sorted(d.glob("*.json")):
+            try:
+                data = json.loads(p.read_text())
+                claimed = data.get("user", "")
+                if claimed in seen:
+                    continue
+                file_owner = pwd.getpwuid(p.stat().st_uid).pw_name
+                if file_owner != claimed:
+                    continue
+                seen.add(claimed)
+                locks.append(data)
+            except Exception:
+                pass
+    return locks
 
 
 # ---------------------------------------------------------------------------
@@ -384,11 +411,34 @@ def print_login_contention_summary() -> None:
         except Exception:
             pass
 
+    # Read active server locks
+    try:
+        current_user = pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        current_user = ""
+    locks = read_server_locks()
+    other_locks = [lk for lk in locks if lk.get("user") != current_user]
+
     # Print
     print()
     print("=" * 68)
     print(f"  SERVER STATUS — {hostname}")
     print("=" * 68)
+
+    # Show other users' locks prominently before the load summary
+    if other_locks:
+        for lk in other_locks:
+            name  = lk.get("display_name", lk.get("user", "?"))
+            user  = lk.get("user", "?")
+            msg   = lk.get("message", "")
+            try:
+                since = datetime.fromisoformat(lk["locked_at"]).strftime("%H:%M")
+            except Exception:
+                since = lk.get("locked_at", "?")
+            print(f"  ⚠  NOTICE from {name} ({user}) — since {since}")
+            print(f'     "{msg}"')
+        print()
+
     print(
         f"  Load   : {load1:.1f} / {ncpu} CPUs  [{load_lv}]  ({load_pct:.0f}% utilization)"
     )
@@ -476,7 +526,7 @@ def main():
     print()
 
     # Prefer system-wide pre-reboot snapshot for hardware diff (written by
-    # server-reboot-guardian just before shutdown) — falls back to the user's
+    # server-manager just before shutdown) — falls back to the user's
     # last-login snapshot which may be older.
     baseline: dict | None = None
     baseline_label = ""

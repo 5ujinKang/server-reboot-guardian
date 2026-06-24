@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""
+server-lock — mark your session as performance-critical so others know.
+
+Usage:
+  server-lock on [message]   set the lock (optional custom message)
+  server-lock off            clear your lock
+  server-lock status         show all active locks
+"""
+
+import json
+import os
+import pwd
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# System-wide dir (created by install.sh with 1777) preferred;
+# /tmp fallback works without root and clears naturally at reboot.
+_LOCK_DIRS = [
+    Path("/var/lib/server-manager/locks"),
+    Path("/tmp/server-guardian-locks"),
+]
+
+DEFAULT_MESSAGE = (
+    "running performance critical work — "
+    "please avoid heavy jobs or contact me"
+)
+
+
+def get_lock_dir() -> Path:
+    for d in _LOCK_DIRS:
+        if d.exists() and os.access(d, os.W_OK):
+            return d
+    # Auto-create the /tmp fallback with sticky+world-writable
+    d = _LOCK_DIRS[-1]
+    try:
+        d.mkdir(mode=0o1777, exist_ok=True)
+        os.chmod(d, 0o1777)
+    except Exception as e:
+        print(f"Error: cannot create lock directory: {e}", file=sys.stderr)
+        sys.exit(1)
+    return d
+
+
+def get_user_info() -> tuple[str, str]:
+    pw = pwd.getpwuid(os.getuid())
+    username = pw.pw_name
+    gecos_name = pw.pw_gecos.split(",")[0].strip()
+    display_name = gecos_name if gecos_name else username
+    return username, display_name
+
+
+def read_all_locks() -> list[dict]:
+    """Read lock files from all known directories, deduplicated by username."""
+    seen: set[str] = set()
+    locks: list[dict] = []
+    for d in _LOCK_DIRS:
+        if not d.exists():
+            continue
+        for p in sorted(d.glob("*.json")):
+            try:
+                data = json.loads(p.read_text())
+                claimed = data.get("user", "")
+                if claimed in seen:
+                    continue
+                # Verify file is owned by the user it claims to be
+                file_owner = pwd.getpwuid(p.stat().st_uid).pw_name
+                if file_owner != claimed:
+                    continue
+                seen.add(claimed)
+                locks.append(data)
+            except Exception:
+                pass
+    return locks
+
+
+def fmt_time(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso
+
+
+def cmd_on(message: str) -> None:
+    username, display_name = get_user_info()
+    lock_dir = get_lock_dir()
+    lp = lock_dir / f"{username}.json"
+    data = {
+        "user": username,
+        "display_name": display_name,
+        "message": message,
+        "locked_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    lp.write_text(json.dumps(data, indent=2))
+    os.chmod(lp, 0o644)
+    print(f'Server lock ON — others will see this at login.')
+    print(f'Message: "{message}"')
+
+
+def cmd_off() -> None:
+    username, _ = get_user_info()
+    removed = False
+    for d in _LOCK_DIRS:
+        lp = d / f"{username}.json"
+        if lp.exists():
+            try:
+                lp.unlink()
+                removed = True
+            except PermissionError:
+                print(f"Error: cannot remove {lp} (permission denied)", file=sys.stderr)
+                sys.exit(1)
+    print("Server lock OFF." if removed else "No active lock found for you.")
+
+
+def cmd_status() -> None:
+    locks = read_all_locks()
+    if not locks:
+        print("No active server locks.")
+        return
+    print(f"\n  ACTIVE SERVER LOCKS ({len(locks)})")
+    print("  " + "-" * 56)
+    for lk in locks:
+        user    = lk.get("user", "?")
+        name    = lk.get("display_name", user)
+        msg     = lk.get("message", "")
+        since   = fmt_time(lk.get("locked_at", ""))
+        print(f"  {name} ({user})  —  since {since}")
+        print(f'    "{msg}"')
+    print()
+
+
+def main() -> None:
+    if len(sys.argv) < 2 or sys.argv[1] not in ("on", "off", "status"):
+        print(__doc__.strip())
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    if cmd == "on":
+        msg = " ".join(sys.argv[2:]).strip() if len(sys.argv) > 2 else DEFAULT_MESSAGE
+        cmd_on(msg)
+    elif cmd == "off":
+        cmd_off()
+    elif cmd == "status":
+        cmd_status()
+
+
+if __name__ == "__main__":
+    main()

@@ -132,6 +132,7 @@ def get_user_processes(target_users):
         timeout=15,
     )
     target = set(target_users)
+    self_pid = os.getpid()
     user_procs = defaultdict(list)
 
     for line in out.splitlines():
@@ -151,6 +152,8 @@ def get_user_processes(target_users):
         except (ValueError, IndexError):
             continue
 
+        if pid == self_pid:
+            continue
         if comm in SKIP_COMMS:
             continue
         # Kernel helpers / PAM workers show as "(name)" — always skip
@@ -277,6 +280,39 @@ def get_current_user():
 
 
 # ---------------------------------------------------------------------------
+# Server locks
+# ---------------------------------------------------------------------------
+
+_LOCK_DIRS = [
+    Path("/var/lib/server-manager/locks"),
+    Path("/tmp/server-guardian-locks"),
+]
+
+
+def read_server_locks() -> list[dict]:
+    import pwd as _pwd
+    seen: set[str] = set()
+    locks: list[dict] = []
+    for d in _LOCK_DIRS:
+        if not d.exists():
+            continue
+        for p in sorted(d.glob("*.json")):
+            try:
+                data = json.loads(p.read_text())
+                claimed = data.get("user", "")
+                if claimed in seen:
+                    continue
+                file_owner = _pwd.getpwuid(p.stat().st_uid).pw_name
+                if file_owner != claimed:
+                    continue
+                seen.add(claimed)
+                locks.append(data)
+            except Exception:
+                pass
+    return locks
+
+
+# ---------------------------------------------------------------------------
 # Verdict: is the server available for me?
 # ---------------------------------------------------------------------------
 
@@ -310,6 +346,16 @@ _COMPUTE_COMMS = frozenset([
     "torch", "tensorflow",
 ])
 
+# AI coding agents: meaningful by intent even at low CPU (waiting on API calls,
+# but may spawn builds/tests/training at any moment)
+_AGENT_COMMS = frozenset([
+    "codex",     # OpenAI Codex CLI
+    "aider",     # Aider AI coding agent
+    "opencode",  # OpenCode agent
+    "claude",    # Claude CLI
+    "gemini",    # Gemini CLI
+])
+
 
 def _is_idle(proc):
     """Return True if the process is an idle editor/shell/helper — not compute work."""
@@ -339,26 +385,33 @@ def _is_meaningful(proc, gpu_pid_set):
     elapsed = proc["elapsed_s"]
     comm = proc["comm"]
 
+    # Brand-new processes: CPU readings are unreliable at startup (e.g. command-not-found)
+    if elapsed < 5:
+        return False
+
     # Any GPU allocation = meaningful by definition
     if proc["pid"] in gpu_pid_set:
         return True
 
-    # Ignore brand-new processes (elapsed < 5s): instantaneous CPU readings are
-    # unreliable at startup and catch transient shell helpers like command-not-found.
-    if elapsed < 5:
-        return False
-
-    # Known compute command with sustained CPU
-    if comm in _COMPUTE_COMMS and cpu >= 5.0:
+    # Known compute command at any real activity level
+    # Threshold 2%: real jobs briefly dip here between data loads / epochs
+    if comm in _COMPUTE_COMMS and cpu >= 2.0:
         return True
 
-    # Heavy CPU on any non-idle process
-    if cpu >= 20.0:
+    # AI coding agents: meaningful when actively running (cpu > 0 means not a stale session)
+    # Low-CPU is expected — they wait on API calls, but may spawn builds at any moment
+    if comm in _AGENT_COMMS and cpu >= 0.1:
         return True
 
-    # Long-running with significant memory loaded + active CPU
-    # (e.g. training job between epochs, loaded R/Python dataset)
-    if elapsed >= 600 and mem_kb >= 1024 * 1024 and cpu >= 1.0:
+    # Any non-idle process doing substantial single-core work
+    # Catches real compute with non-standard binary names (e.g. gemm.fastpath.r, train, a.out)
+    if cpu >= 10.0:
+        return True
+
+    # Long-running with significant memory loaded + any CPU
+    # (job between batches, training checkpoint, loaded dataset)
+    # 512MB threshold: avoids flagging background services on a 251GB server
+    if elapsed >= 600 and mem_kb >= 512 * 1024 and cpu >= 0.5:
         return True
 
     return False
@@ -384,13 +437,26 @@ def assess_others(current_user, user_procs, ncpu, gpu_info):
         if user == current_user:
             continue
         meaningful = [p for p in procs if _is_meaningful(p, gpu_pid_set)]
+
+        # Aggregate fallback: catch multi-worker jobs where no single process
+        # hits per-process thresholds (e.g. 10 Python workers each at 2% CPU)
+        if not meaningful:
+            non_idle = [p for p in procs
+                        if not _is_idle(p) and p["elapsed_s"] >= 5]
+            if sum(p["cpu"] for p in non_idle) >= 15.0:
+                meaningful = sorted(non_idle, key=lambda p: (-p["cpu"], -p["mem_kb"]))
+
         if meaningful:
             busy_users[user] = meaningful
         else:
             # Summarise what they appear to be doing (for idle description)
             dominant = procs[0] if procs else None
             if dominant:
-                if any(".vscode-server" in p["args"] or p["comm"].startswith("code-") for p in procs):
+                # Priority order: agent (stale/0-CPU) > IDE > multiplexer > shell > dominant
+                agent_procs = [p for p in procs if p["comm"] in _AGENT_COMMS]
+                if agent_procs:
+                    label = f"{agent_procs[0]['comm']}/idle"
+                elif any(".vscode-server" in p["args"] or p["comm"].startswith("code-") for p in procs):
                     label = "VSCode"
                 elif any(p["comm"] in ("tmux:", "tmux", "screen") for p in procs):
                     label = "tmux/idle"
@@ -406,7 +472,6 @@ def assess_others(current_user, user_procs, ncpu, gpu_info):
     verdict = "CLEAR"
 
     if busy_users:
-        # Score severity
         total_other_cpu = sum(
             sum(p["cpu"] for p in ps) for ps in busy_users.values()
         )
@@ -414,9 +479,10 @@ def assess_others(current_user, user_procs, ncpu, gpu_info):
             any(p["pid"] in gpu_pid_set for p in ps)
             for ps in busy_users.values()
         )
-        # On a large server, scale by cores; cap so even 1-core job on huge server matters
-        cpu_score = total_other_cpu / max(ncpu, 1)  # fraction of server
-        if has_gpu or total_other_cpu >= ncpu * 60 or cpu_score >= 0.6:
+        # cpu% in ps is per-core (100 = 1 core fully used).
+        # cpu_fraction = fraction of total server capacity consumed.
+        cpu_fraction = total_other_cpu / (max(ncpu, 1) * 100)
+        if has_gpu or cpu_fraction >= 0.20:
             verdict = "BUSY"
         else:
             verdict = "CAUTION"
@@ -425,44 +491,61 @@ def assess_others(current_user, user_procs, ncpu, gpu_info):
             total_cpu = sum(p["cpu"] for p in procs)
             total_mem = sum(p["mem_kb"] for p in procs)
             top = procs[0]
+            is_agent_top = top["comm"] in _AGENT_COMMS
             parts = [
                 f"CPU:{total_cpu:.0f}%",
                 f"MEM:{format_mem(total_mem)}",
             ]
             if any(p["pid"] in gpu_pid_set for p in procs):
                 parts.append("GPU:active")
+            if is_agent_top:
+                parts.append("AI-agent")
             desc = "  ".join(parts)
             cmd = truncate(top["args"], 42)
             lines.append(
                 f"  {user}: {desc}  [{top['comm']} — up {format_elapsed(top['elapsed_s'])}]  {cmd}"
             )
 
+    # Determine what's driving the caution so the message can be specific
+    agent_only = bool(busy_users) and all(
+        p["comm"] in _AGENT_COMMS
+        for ps in busy_users.values()
+        for p in ps
+    )
+
     idle_blurb = ""
     if idle_users:
         idle_blurb = ", ".join(f"{u} ({lbl})" for u, lbl in sorted(idle_users.items()))
 
-    return verdict, lines, idle_blurb
+    return verdict, lines, idle_blurb, agent_only
 
 
-def _verdict_box(verdict, detail_lines, idle_blurb, W):
+def _verdict_box(verdict, detail_lines, idle_blurb, W, agent_only=False):
     """Render the top-of-report verdict box."""
     ICONS = {"CLEAR": "✓", "CAUTION": "!", "BUSY": "✗"}
     icon = ICONS.get(verdict, "?")
 
     out = []
+    note = ""  # optional guidance line printed after detail lines
     if verdict == "CLEAR":
         if idle_blurb:
             msg = f"CLEAR — no compute jobs from others  ({idle_blurb})"
         else:
             msg = "CLEAR — no other users running active workloads"
     elif verdict == "CAUTION":
-        msg = "CAUTION — others have active workloads, check before starting heavy jobs"
+        if agent_only:
+            # AI agents use minimal CPU while waiting on API calls, but can
+            # suddenly kick off builds, tests, or large model calls. The flag
+            # is about unpredictable future spikes, not current usage.
+            msg = "CAUTION — AI agent active; low now, but can spike without warning"
+            note = "  → Judge by the load numbers below, not this banner alone."
+        else:
+            msg = "CAUTION — compute jobs running; check load below before heavy work"
     else:
-        msg = "BUSY — server is under significant load from other users"
+        msg = "BUSY — significant load from others; coordinate before starting heavy work"
 
     border = "=" * W
     inner  = f"  {icon}  {msg}"
-    # Pad to W
     pad = W - len(inner) - 1
     inner  = inner + (" " * max(pad, 0))
 
@@ -471,6 +554,8 @@ def _verdict_box(verdict, detail_lines, idle_blurb, W):
     if detail_lines:
         for dl in detail_lines:
             out.append(dl)
+    if note:
+        out.append(note)
     out.append(border)
     return out
 
@@ -502,11 +587,27 @@ def build_report(users=None, top_n=5, skip_disk=False):
     out = []
 
     # ---- Verdict (top of report) ----
-    verdict, verdict_detail, idle_blurb = assess_others(current_user, user_procs, ncpu, gpu)
+    verdict, verdict_detail, idle_blurb, agent_only = assess_others(current_user, user_procs, ncpu, gpu)
     out.append("")
-    out += _verdict_box(verdict, verdict_detail, idle_blurb, W)
-    out.append("")
+    out += _verdict_box(verdict, verdict_detail, idle_blurb, W, agent_only=agent_only)
 
+    # ---- Active server locks ----
+    locks = read_server_locks()
+    if locks:
+        out.append("")
+        for lk in locks:
+            user  = lk.get("user", "?")
+            name  = lk.get("display_name", user)
+            msg   = lk.get("message", "")
+            try:
+                since = datetime.fromisoformat(lk["locked_at"]).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                since = lk.get("locked_at", "?")
+            marker = "  (your lock)" if user == current_user else ""
+            out.append(f"  ⚠  {name} ({user}) has a server lock — since {since}{marker}")
+            out.append(f'     "{msg}"')
+
+    out.append("")
     out.append("=" * W)
     out.append("  USER PROCESS & HARDWARE CONTENTION REPORT")
     out.append(f"  {hostname}  |  {now.strftime('%Y-%m-%d %H:%M:%S')}  |  {ncpu} CPUs")
